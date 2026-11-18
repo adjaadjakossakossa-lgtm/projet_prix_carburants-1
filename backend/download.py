@@ -1,0 +1,176 @@
+"""Téléchargement des données brutes : flux quotidien (data.gouv.fr), taux EUR/USD (BCE) et
+archives annuelles XML (historique des prix).
+
+Usage : python -m backend.download [--annees 2025 2026] [--forcer]
+
+Les archives vont dans data/raw/historique_xml/, les CSV dans data/raw/, et ne sont jamais
+modifiés ensuite. Chaque téléchargement est noté dans data/raw/manifest.json (URL, date,
+taille, SHA-256). Un fichier déjà présent n'est pas retéléchargé, sauf avec --forcer :
+à faire chaque matin pour le conseil du jour (flux, taux et archive de l'année en cours changent
+chaque jour à la source).
+"""
+import argparse
+import hashlib
+import json
+import shutil
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.request import urlopen
+
+import truststore
+
+from backend.config import (
+    ANNEES,
+    DELAI_TELECHARGEMENT_S,
+    DOSSIER_HISTORIQUE,
+    FICHIER_FLUX,
+    FICHIER_MANIFESTE,
+    FICHIER_TAUX,
+    URL_ARCHIVE_ANNUELLE,
+    URL_FLUX,
+    URL_PAGE_ARCHIVES,
+    URL_PAGE_FLUX,
+    URL_TAUX,
+)
+
+
+def url_archive(annee: int) -> str:
+    return URL_ARCHIVE_ANNUELLE.format(annee=annee)
+
+
+def chemin_archive(annee: int, dossier: Path) -> Path:
+    return dossier / f"PrixCarburants_annuel_{annee}.zip"
+
+
+def empreinte_sha256(chemin: Path) -> str:
+    empreinte = hashlib.sha256()
+    with chemin.open("rb") as flux:
+        for bloc in iter(lambda: flux.read(1024 * 1024), b""):
+            empreinte.update(bloc)
+    return empreinte.hexdigest()
+
+
+def ouvrir_distant(url: str, delai: int):
+    # Certificats du système d'exploitation (utile derrière un proxy d'entreprise ou d'école), activés
+    # seulement au moment de télécharger : importer le backend ne modifie pas le SSL de Python.
+    truststore.inject_into_ssl()
+    # urlopen suit la redirection de data.gouv.fr vers l'export de data.economie.gouv.fr.
+    return urlopen(url, timeout=delai)
+
+
+def _entree_manifeste(cible: Path, url: str, source: str, **extra) -> dict:
+    return {
+        "fichier": cible.name,
+        "url": url,
+        "page_source": source,
+        "telecharge_le_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "taille_octets": cible.stat().st_size,
+        "sha256": empreinte_sha256(cible),
+        **extra,
+    }
+
+
+def telecharger_et_verifier(url: str, cible: Path, verifier, ouvrir_url=ouvrir_distant) -> None:
+    """Télécharge `url` dans un fichier `.part`, le contrôle avec `verifier(partiel)`, puis le renomme en
+    `cible`. En cas d'erreur (réseau, contrôle, interruption), le `.part` est supprimé et `cible` intacte."""
+    cible.parent.mkdir(parents=True, exist_ok=True)
+    partiel = cible.with_name(cible.name + ".part")
+    try:
+        with ouvrir_url(url, DELAI_TELECHARGEMENT_S) as reponse, partiel.open("wb") as sortie:
+            shutil.copyfileobj(reponse, sortie)
+        verifier(partiel)
+    except BaseException:
+        partiel.unlink(missing_ok=True)
+        raise
+    partiel.replace(cible)
+
+
+def afficher_telechargement(nom: str, entree: dict | None, cible: Path) -> None:
+    if entree is None:
+        print(f"{nom} : déjà présent, ignoré ({cible})")
+    else:
+        print(f"{nom} : {entree['taille_octets']:,} octets, sha256 {entree['sha256'][:12]}…")
+
+
+def telecharger_archive(annee: int, dossier: Path = DOSSIER_HISTORIQUE, forcer: bool = False,
+                        ouvrir_url=ouvrir_distant) -> dict | None:
+    """Télécharge l'archive d'une année. Renvoie l'entrée du manifeste, ou None si déjà présente."""
+    cible = chemin_archive(annee, dossier)
+    if cible.exists() and not forcer:
+        return None
+
+    url = url_archive(annee)
+
+    def verifier_zip(partiel: Path) -> None:
+        if not zipfile.is_zipfile(partiel):
+            raise ValueError(f"Le fichier reçu pour {annee} n'est pas une archive ZIP : {url}")
+        with zipfile.ZipFile(partiel) as archive:
+            membre_casse = archive.testzip()
+        if membre_casse is not None:
+            raise ValueError(f"Archive {annee} corrompue (membre {membre_casse}) : {url}")
+
+    telecharger_et_verifier(url, cible, verifier_zip, ouvrir_url)
+    return _entree_manifeste(cible, url, URL_PAGE_ARCHIVES, annee=annee)
+
+
+def telecharger_csv(url: str, cible: Path, entete_attendue: str, forcer: bool = False,
+                    ouvrir_url=ouvrir_distant, page_source: str | None = None) -> dict | None:
+    """Télécharge un CSV. Renvoie l'entrée du manifeste, ou None si déjà présent.
+
+    Le fichier est rejeté (ValueError) si sa première ligne ne commence pas par entete_attendue.
+    """
+    if cible.exists() and not forcer:
+        return None
+
+    def verifier_entete(partiel: Path) -> None:
+        premiere_ligne = partiel.read_bytes().decode("utf-8-sig", errors="replace").splitlines()[:1]
+        if not premiere_ligne or not premiere_ligne[0].startswith(entete_attendue):
+            raise ValueError(f"En-tête inattendu (attendu : {entete_attendue}) : {url}")
+
+    telecharger_et_verifier(url, cible, verifier_entete, ouvrir_url)
+    return _entree_manifeste(cible, url, page_source or url)
+
+
+def mettre_a_jour_manifeste(entrees: list[dict], manifeste: Path = FICHIER_MANIFESTE) -> None:
+    """Ajoute ou remplace les entrées du manifeste, indexées par nom de fichier."""
+    contenu = {}
+    if manifeste.exists():
+        contenu = json.loads(manifeste.read_text(encoding="utf-8"))
+    for entree in entrees:
+        contenu[entree["fichier"]] = entree
+    manifeste.parent.mkdir(parents=True, exist_ok=True)
+    manifeste.write_text(json.dumps(contenu, indent=2, ensure_ascii=False, sort_keys=True),
+                         encoding="utf-8")
+
+
+def telecharger_tout(forcer: bool = False, annees=ANNEES) -> list[dict]:
+    """Télécharge archives, flux et taux. Renvoie les nouvelles entrées et met à jour le manifeste."""
+    entrees = []
+    for annee in annees:
+        entree = telecharger_archive(annee, forcer=forcer)
+        afficher_telechargement(str(annee), entree, chemin_archive(annee, DOSSIER_HISTORIQUE))
+        entrees.append(entree)
+    for url, cible, entete, page in ((URL_FLUX, FICHIER_FLUX, "Code postal;", URL_PAGE_FLUX),
+                                     (URL_TAUX, FICHIER_TAUX, "KEY,", URL_TAUX)):
+        entree = telecharger_csv(url, cible, entete, forcer=forcer, page_source=page)
+        afficher_telechargement(cible.name, entree, cible)
+        entrees.append(entree)
+    nouvelles = [entree for entree in entrees if entree is not None]
+    if nouvelles:
+        mettre_a_jour_manifeste(nouvelles)
+    return nouvelles
+
+
+def main(argv: list[str] | None = None) -> int:
+    analyseur = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    analyseur.add_argument("--annees", type=int, nargs="+", default=list(ANNEES))
+    analyseur.add_argument("--forcer", action="store_true",
+                           help="retélécharge même si le fichier existe")
+    args = analyseur.parse_args(argv)
+    telecharger_tout(forcer=args.forcer, annees=args.annees)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

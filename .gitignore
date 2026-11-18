@@ -1,0 +1,24 @@
+# Environnement Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Secrets
+.env
+.env.*
+.streamlit/secrets.toml
+
+# Données téléchargées et base (retéléchargées par python -m backend.train)
+data/raw/*
+!data/raw/.gitkeep
+data/carburants.db
+
+# Modèle et résultats (produits par python -m backend.train)
+models/
+
+# Fichiers système
+.DS_Store
+Thumbs.db
+*.log
